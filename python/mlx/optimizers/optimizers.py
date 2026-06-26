@@ -4,6 +4,11 @@ from typing import Callable, List, Optional, Tuple, Union
 
 import mlx.core as mx
 from mlx.nn import Module
+from mlx.optimizers.distributed_muon import (
+    balance_orthogonalization,
+    orthogonalization_shapes,
+    orthogonalize_distributed,
+)
 from mlx.utils import tree_flatten, tree_map, tree_merge, tree_reduce, tree_unflatten
 
 
@@ -869,6 +874,14 @@ class Muon(Optimizer):
             better performance.  Default: ``True``
         ns_steps (int, optional): Number of Newton-Schulz iteration steps for
             orthogonalization.  Default: ``5``
+        distributed (bool, optional): Shard the Newton-Schulz orthogonalization
+            across the data-parallel group instead of replicating it on every
+            rank. Each weight matrix is orthogonalized by a single rank and the
+            result is shared with one ``all_sum``, cutting the per-rank
+            optimizer compute to roughly ``1 / group_size``. The numerical
+            update is unchanged. Default: ``False``
+        group (mlx.core.distributed.Group, optional): The group to shard over
+            when ``distributed`` is enabled. Defaults to the global group.
     """
 
     def __init__(
@@ -878,6 +891,8 @@ class Muon(Optimizer):
         weight_decay: float = 0.01,
         nesterov: bool = True,
         ns_steps: int = 5,
+        distributed: bool = False,
+        group: Optional["mx.distributed.Group"] = None,
     ):
         super().__init__()
 
@@ -886,10 +901,27 @@ class Muon(Optimizer):
         self.weight_decay = weight_decay
         self.nesterov = nesterov
         self.ns_steps = ns_steps
+        self.distributed = distributed
+        self._group = group
+        self._ortho_owners = None
+        self._ortho_index = 0
 
     def init_single(self, parameter: mx.array, state: dict):
         """Initialize optimizer state"""
         state["v"] = mx.zeros_like(parameter)
+
+    def apply_gradients(self, gradients: dict, parameters: dict):
+        """Plan the (optionally sharded) orthogonalization, then apply Muon."""
+        if self.distributed:
+            group = self._group or mx.distributed.init()
+            grads = [v for _, v in tree_flatten(gradients)]
+            shapes = orthogonalization_shapes(grads)
+            self._ortho_group = group
+            self._ortho_owners = balance_orthogonalization(shapes, group.size())
+            self._ortho_index = 0
+        else:
+            self._ortho_owners = None
+        return super().apply_gradients(gradients, parameters)
 
     def _zeropower_via_newtonschulz5(self, X, steps: int):
         assert (
@@ -936,7 +968,17 @@ class Muon(Optimizer):
             if reshape_needed:
                 update = mx.reshape(update, (update.shape[0], -1))
 
-            update = self._zeropower_via_newtonschulz5(update, steps=self.ns_steps)
+            if self._ortho_owners is not None:
+                owner = self._ortho_owners[self._ortho_index]
+                self._ortho_index += 1
+                update = orthogonalize_distributed(
+                    update,
+                    lambda u: self._zeropower_via_newtonschulz5(u, steps=self.ns_steps),
+                    owner,
+                    self._ortho_group,
+                )
+            else:
+                update = self._zeropower_via_newtonschulz5(update, steps=self.ns_steps)
 
             if reshape_needed:
                 update = mx.reshape(update, original_shape)
